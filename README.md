@@ -12,10 +12,15 @@ Built on the [Conmy et al. (2023) ACDC codebase](https://github.com/ArthurConmy/
 
 This project systematically benchmarks nine corruption strategies applied to Automatic Circuit Discovery (ACDC) on the Python Docstring Completion task, evaluating circuit quality and whether a two-pass procedure combining two corruptions outperforms any single-pass run.
 
-**Three research questions:**
+**Three research questions were addressed:**
 - RQ1: Which corruption strategies produce the highest-yield circuits?
 - RQ2: Do high-yield corruptions recover distinct or overlapping circuits?
 - RQ3: Can a two-pass procedure outperform single-pass at comparable sparsity?
+
+**Main Result:**
+1. The method of corruption used by Conmy et al., complete token randomisation (random ablation), proved to be the most effective single pass corruption by a substantial difference.
+2. As a result of the destructive nature of random ablation, all corruption strategies (except for zero ablation) effectively recovered a subset of the circuit gained from random ablation
+3. It was found that an approach of using a random ablation circuit as a filter for an edge pool derived using zero ablation yields a circuit with empirically higher quality than single-pass random ablation, as well as outperforming the Ground-Truth - potentially due to finding edges which were previously unspecified in the codebase.    
 
 ---
 
