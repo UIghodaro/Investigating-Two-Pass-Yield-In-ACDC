@@ -1,68 +1,60 @@
-# compare_edges.py
-# Use to compare the edges between 2 different ACDC runs (edges are stored in pickle dump files)
-# Use ``python inspect_pkls.py \runs\[The run you intend to see]\another_final_edges.pkl``  to print the edges saved from an ACDC run of your choice
-# If the run has not been saved yet (most recent run), you may run ``python inspect_pkls.py`` to inspect it with less hassle
+"""
+compare_edges.py — Pairwise edge comparison between two ACDC runs
+-----------------------------------------------------------------
+Loads two another_final_edges.pkl files and reports: edge counts,
+overlap, Jaccard similarity, and the top-N edges unique to each.
 
-# edges.pkl is expected to be a list of items like: ((dst_hook, dst_index, src_hook, src_index), score) [Essentially, edge ID (Node1, Node2) and its importance score]
-
+Usage:
+  python compare_edges.py runs/<run_a>/another_final_edges.pkl \\
+                          runs/<run_b>/another_final_edges.pkl
+  python compare_edges.py <base.pkl> <other.pkl> --top 20
+"""
 
 import argparse
 import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-EdgeKey = Tuple[Any, Any, Any, Any]   # ('dst', slice, 'src', slice) with weird slice objects
+EdgeKey = Tuple[Any, Any, Any, Any]
 Edge = Tuple[EdgeKey, float]
 
-# Load and validate the edges in edges.pkl
+
 def load_edges(path: Path) -> List[Edge]:
+    """Load and validate an edge pkl file; skip None-scored placeholder edges."""
     skipped = 0
     with path.open("rb") as f:
         obj = pickle.load(f)
     if not isinstance(obj, list):
         raise TypeError(f"{path} expected list, got {type(obj)}")
-    
-    # Ensure it's list[(key, score)]
     out: List[Edge] = []
     for item in obj:
         if not (isinstance(item, tuple) and len(item) == 2):
-            raise TypeError(f"{path} expected tuple(key, score), got {item!r}")
+            raise TypeError(f"{path} expected (key, score) tuple, got {item!r}")
         key, score = item
-        
-        # Some runs may contain placeholder edges with score 'None'
-        if score is None:                       
+        if score is None:
             skipped += 1
             continue
-        out.append((key, float(score)))         # Convert score to a float for numeric comparison
-    
+        out.append((key, float(score)))
     if skipped:
-        print(f"{path}: {skipped} edges were skipped due to having an importance score of 'None' recorded")
-    
+        print(f"{path}: skipped {skipped} placeholder edge(s) with score=None")
     return out
 
-# Type Conversion to make edge keys hashable
+
 def key_to_str(k: EdgeKey) -> str:
-    # repr keeps the "[:]" objects readable
     return repr(k)
 
-# Convert List[(key, score)] to Dict[str_key, score]
-def as_dict(edges: Iterable[Edge]) -> Dict[str, float]:
-    # canonicalise edge key to string so it can be hashed robustly
-    d: Dict[str, float] = {}
-    for k, s in edges:
-        d[key_to_str(k)] = s
-    return d
 
-# Compute the Jaccard similarity of the two sets
-# J(A,B) = |A n B| / |A u B|                     (Imagine set notation, |A \intersect B| \divide |A \union B|)
+def as_dict(edges: Iterable[Edge]) -> Dict[str, float]:
+    """Convert edge list to {str_key: score} dict for set-based comparison."""
+    return {key_to_str(k): s for k, s in edges}
+
+
 def jaccard(a: set, b: set) -> float:
-    if not a and not b:                          # Avoid division by 0
+    if not a and not b:
         return 1.0
     return len(a & b) / len(a | b)
 
 
-# Parses a 'base' and 'other' file of edges (two different ACDC runs, hopefully of the same task under different metrics, thresholds or corruptions)
-# Prints are self-explanatory given the above functions
 def main():
     parser = argparse.ArgumentParser(description="Compare two ACDC edge.pkl outputs.")
     parser.add_argument("base", type=str, help="Baseline edges.pkl")

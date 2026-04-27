@@ -1,15 +1,28 @@
+"""
+Stage 0 - run_suite.py
+----------------------
+Automate the full ACDC corruption suite, running all conditions sequentially
+and collecting results into a timestamped summary JSON.
+
+Usage:
+  python run_suite.py --task docstring --device cpu --threshold 0.10 --seeds 0
+"""
+
 import argparse
 import json
 import os
 import platform
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-# This script is created to automate the entire 'running' part of the test pipeline, creating a summary of results
 
-# Stream commands to the console to start a run, also save console outputs to a file 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def run(cmd, cwd=None, stdout_path=None):
     print("\n>>>", " ".join(cmd), "\n")
     
@@ -19,28 +32,31 @@ def run(cmd, cwd=None, stdout_path=None):
 
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     with open(stdout_path, "w", encoding="utf-8") as f:
-        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in p.stdout:
-            sys.stdout.write(line)
-            f.write(line)
-        rc = p.wait()
+        # expandable_segments=True tells PyTorch's CUDA allocator to grow existing
+        # memory segments rather than always requesting new fixed-size blocks.
+        # This prevents OOM errors caused by allocator fragmentation on small GPUs
+        # (observed on RTX 3050 4GB when the unembed logit tensor can't be placed
+        # in a contiguous block despite sufficient total free VRAM).
+        # PyTorch's own OOM error message suggested this setting as a remedy.
+        env = os.environ.copy()
+        if "--device" in cmd and cmd[cmd.index("--device") + 1] == "cuda":
+            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        try:
+            for line in p.stdout:
+                sys.stdout.write(line)
+                f.write(line)
+        finally:
+            # Explicitly close the pipe handle in the finally block so it is
+            # released immediately rather than waiting for CPython's GC.
+            # On Windows, GC timing is non-deterministic and pipe handles left
+            # open across multiple subprocess runs caused progressive resource
+            # exhaustion: run 2 crashed mid-init, run 3 crashed earlier, run 4
+            # crashed during Python imports before any ACDC code ran.
+            p.stdout.close()
+            rc = p.wait()
         if rc != 0:
             raise subprocess.CalledProcessError(rc, cmd)
-
-# Auto git commits 
-def safe_git_info(repo_root: Path):
-    def _try(args):
-        try:
-            out = subprocess.check_output(args, cwd=repo_root, text=True).strip()
-            return out
-        except Exception:
-            return None
-
-    return {
-        "commit": _try(["git", "rev-parse", "HEAD"]),
-        "status": _try(["git", "status", "--porcelain"]),
-        "branch": _try(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
-    }
 
 def python_env_info():
     info = {
@@ -74,15 +90,20 @@ def load_edges_count(run_dir: Path):
         return None
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--task", default="docstring")
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--threshold", type=float, default=0.05)
-    ap.add_argument("--corrupted-batch-size", type=int, default=4)
-    ap.add_argument("--seeds", default="0,1", help="comma-separated seeds, e.g. 0,1")
-    ap.add_argument("--metric", default=None, help="")
-    ap.add_argument("--extra", default="", help="extra flags to be passed through to acdc.main")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Stage 0: automated multi-condition ACDC corruption suite runner."
+    )
+    parser.add_argument("--task", default="docstring")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--threshold", type=float, default=0.1)
+    parser.add_argument("--corrupted-batch-size", type=int, default=0,
+        help="Examples per batch for corrupted cache build. Lower = less GPU memory.")
+    # Seeds do not alter results for the docstring task — internal seed is fixed.
+    parser.add_argument("--seeds", default="0", help="Comma-separated seeds, e.g. 0,1")
+    parser.add_argument("--metric", default=None)
+    parser.add_argument("--extra", default="",
+        help="Extra flags passed through verbatim to acdc.main.")
+    args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
     runs_root = repo_root / "runs"
@@ -106,8 +127,8 @@ def main():
 
     # If a condition doesn't work, comment it out and rerun.
     conditions = (
-        [("zero_ablation", ["--zero-ablation"])]
-        + [(v, ["--dataset-version", v]) for v in DOCSTRING_VERSIONS]
+        [(v, ["--dataset-version", v]) for v in DOCSTRING_VERSIONS]
+        + [("zero_ablation", ["--zero-ablation"])]
     )
 
     summary_rows = []
@@ -133,12 +154,10 @@ def main():
                 "extra": args.extra,
             }
             (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-            (run_dir / "env.json").write_text(json.dumps(python_env_info(), indent=2), encoding="utf-8")
-            (run_dir / "git.json").write_text(json.dumps(safe_git_info(repo_root), indent=2), encoding="utf-8")
 
             # Build ACDC.main command for console
             cmd = [
-                sys.executable, "-m", "acdc.main",
+                sys.executable, "-u", "-m", "acdc.main",
                 "--task", args.task,
                 "--threshold", str(args.threshold),
                 "--device", args.device,
@@ -155,17 +174,37 @@ def main():
             if args.extra.strip():
                 cmd += args.extra.strip().split()
 
-            # Run and log
+            # Remove stale root-level artefacts so a crashed run doesn't inherit the previous run's files
+            for fname in ["edges.pkl", "another_final_edges.pkl", "mode_b_stats.json"]:
+                (repo_root / fname).unlink(missing_ok=True)
+
+            # Run and log; retry once on crash (0xC0000005 access violations are
+            # non-deterministic on Windows + torch CPU and usually clear on a second attempt)
             stdout_path = run_dir / "stdout.txt"
-            try:
-                run(cmd, cwd=repo_root, stdout_path=stdout_path)
-            except Exception as e:
-                # If a row fails, record it
-                (run_dir / "error.txt").write_text(repr(e), encoding="utf-8")
+            for attempt in range(2):
+                try:
+                    run(cmd, cwd=repo_root, stdout_path=stdout_path)
+                    break  # success
+                except Exception as e:
+                    try:
+                        lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        tail = "\n".join(lines[-30:])
+                    except Exception:
+                        tail = "(stdout unavailable)"
+                    if attempt == 0:
+                        print(f"\n[run_suite] RUN FAILED (attempt 1), retrying: {run_name} "
+                              f"(exit code {e.returncode if hasattr(e, 'returncode') else '?'})",
+                              flush=True)
+                        time.sleep(10)
+                    else:
+                        print(f"\n[run_suite] RUN FAILED (attempt 2), giving up: {run_name} "
+                              f"(exit code {e.returncode if hasattr(e, 'returncode') else '?'})",
+                              flush=True)
+                        (run_dir / "error.txt").write_text(tail, encoding="utf-8")
 
             # Copy expected artefacts into run_dir if they were created elsewhere
             # If ACDC already writes into a run folder, skip this section later.
-            for fname in ["edges.pkl", "another_final_edges.pkl"]:
+            for fname in ["edges.pkl", "another_final_edges.pkl", "mode_b_stats.json"]:
                 src = repo_root / fname
                 if src.exists():
                     dst = run_dir / fname
@@ -175,6 +214,14 @@ def main():
                         pass
 
             edge_count = load_edges_count(run_dir)
+
+            mode_b_stats = {}
+            mode_b_path = run_dir / "mode_b_stats.json"
+            if mode_b_path.exists():
+                try:
+                    mode_b_stats = json.loads(mode_b_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
 
             summary_rows.append({
                 "run_dir": str(run_dir),
@@ -186,11 +233,13 @@ def main():
                 "corrupted_batch_size": args.corrupted_batch_size,
                 "edges_count": edge_count,
                 "status": "ok" if not (run_dir / "error.txt").exists() else "error",
+                **mode_b_stats,
             })
 
     # Write suite summary
     summary_path = runs_root / f"SUITE_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.task}.json"
-    summary_path.write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
+    suite_summary = {"env": python_env_info(), "runs": summary_rows}
+    summary_path.write_text(json.dumps(suite_summary, indent=2), encoding="utf-8")
     print("\nSuite summary:", summary_path)
 
 if __name__ == "__main__":
