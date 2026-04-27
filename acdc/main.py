@@ -58,6 +58,13 @@ except Exception as e:
 # <h2>Imports etc</h2>
 
 #%%
+import warnings
+# Suppress noisy third-party FutureWarnings that are not actionable in this codebase:
+# - transformers registers pytree nodes using a deprecated torch internal API
+# - transformer_lens loads model weights with weights_only=False (trusted local cache)
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*_register_pytree_node.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+
 import wandb
 import IPython
 from IPython.display import Image, display
@@ -95,7 +102,7 @@ try:
     )
 except Exception as e:
     print(f"Could not import `tracr` because {e}; the rest of the file should work but you cannot use the tracr tasks")
-from acdc.docstring.utils import get_all_docstring_things
+from acdc.docstring.utils import get_all_docstring_things, get_docstring_subgraph_true_edges
 from acdc.logic_gates.utils import get_all_logic_gate_things
 from acdc.iterator.utils import get_all_iterate_things
 from acdc.acdc_utils import (
@@ -170,7 +177,7 @@ parser.add_argument("--max-num-epochs",type=int, default=100_000)
 parser.add_argument('--single-step', action='store_true', help='Use single step, mostly for testing')
 parser.add_argument("--abs-value-threshold", action='store_true', help='Use the absolute value of the result to check threshold')
 
-parser.add_argument("--corrupted-batch-size", type=int, default=0, help="Batch size used when building the corrupted cache (Use if having memory problems when running a task, higher number lower memory use).",)
+parser.add_argument("--corrupted-batch-size", type=int, default=0, help="Batch size (examples per batch) used when building the corrupted cache. Set to a small positive integer (e.g. 2) to reduce peak GPU memory usage. Lower values use less memory. 0 = no batching (single forward pass over all examples).",)
 parser.add_argument("--dataset-version", type=str, default="random_random",
     help="Corrupted prompt variant to use for the docstring task. "
          "One of: random_doc, random_def, random_answer, random_def_doc, "
@@ -368,6 +375,16 @@ exp = TLACDCExperiment(
     show_full_index=use_pos_embed,
 )
 
+# Snapshot the full set of non-placeholder edge keys before ACDC begins.
+# ACDC physically removes edges from exp.corr as it prunes them (remove_edge),
+# so by the end of the run all_edges() only contains the surviving circuit edges.
+# Without this snapshot, FN is always 0 and recall is always 1.0.
+all_edge_keys = frozenset(
+    (cn, ci.hashable_tuple, pn, pi.hashable_tuple)
+    for (cn, ci, pn, pi), e in exp.corr.all_edges().items()
+    if e.edge_type != EdgeType.PLACEHOLDER
+)
+
 # %% [markdown]
 # <h2>Run steps of ACDC: iterate over a NODE in the model's computational graph</h2>
 # <p>WARNING! This will take a few minutes to run, but there should be rolling nice pictures too : )</p>
@@ -381,11 +398,14 @@ for i in range(args.max_num_epochs):
     print('>>> Iteration',i)
     exp.step(testing=False)
 
-    show(
-        exp.corr,
-        f"ims/img_new_{i+1}.png",
-        show_full_index=False,
-    )
+    # If running in google COLAB or ipython, a graphviz image is generated and shown every time an edge is pruned. 
+    # Condition this functionality so that main can run with less overhead - especially since the pictures aren't shown in terminal
+    if IN_COLAB or ipython is not None:
+        show(
+            exp.corr,
+            f"ims/img_new_{i+1}.png",
+            show_full_index=False,
+        )
 
     if IN_COLAB or ipython is not None:
         # so long as we're not running this as a script, show the image!
@@ -398,14 +418,50 @@ for i in range(args.max_num_epochs):
         exp.save_edges("edges.pkl")
 
     if exp.current_node is None or SINGLE_STEP:
-        show(
-            exp.corr,
-            f"ims/ACDC_img_{exp_time}.png",
-
-        )
+        try:
+            show(
+                exp.corr,
+                f"ims/ACDC_img_{exp_time}.png",
+            )
+        except Exception as e:
+            print(f"Warning: could not render graph (Graphviz may not be in PATH): {e}")
         break
 
 exp.save_edges("another_final_edges.pkl")
+
+if TASK == "docstring":
+    import json as _json
+    true_edges = get_docstring_subgraph_true_edges()
+    # Surviving circuit edges (ACDC removes edges from corr as it prunes, so
+    # all_edges() only contains the kept edges at this point)
+    circuit_keys = frozenset(
+        (cn, ci.hashable_tuple, pn, pi.hashable_tuple)
+        for (cn, ci, pn, pi), e in exp.corr.all_edges().items()
+        if e.edge_type != EdgeType.PLACEHOLDER
+    )
+    tp = fp = tn = fn = 0
+    for key in all_edge_keys:
+        in_gt = key in true_edges
+        in_circuit = key in circuit_keys
+        if in_circuit:
+            if in_gt: tp += 1
+            else:     fp += 1
+        else:
+            if in_gt: fn += 1
+            else:     tn += 1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    mode_b = {
+        "true_positive": tp, "false_positive": fp,
+        "true_negative": tn, "false_negative": fn,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+    }
+    with open("mode_b_stats.json", "w") as _f:
+        _json.dump(mode_b, _f, indent=2)
+    print(f"Mode B: precision={precision:.3f}  recall={recall:.3f}  F1={f1:.3f}  (TP={tp}, FP={fp}, FN={fn})")
 
 if USING_WANDB:
     edges_fname = f"edges.pth"
@@ -423,7 +479,24 @@ if USING_WANDB:
 # <p>We recover minimal induction machinery! `embed -> a0.0_v -> a1.6k`</p>
 
 #%%
-exp.save_subgraph(
-    return_it=True,
-)
+try:
+    exp.save_subgraph(
+        return_it=True,
+    )
+except Exception as e:
+    print(f"Warning: could not save subgraph (Graphviz may not be in PATH): {e}")
+
+# Explicit CUDA cleanup to avoid Windows access violation at interpreter shutdown.
+# Without this, torch's CUDA finalizers can trigger a segfault (0xC0000005) on exit,
+# which prevents the OS from cleanly releasing GPU memory for the next subprocess.
+try:
+    import gc
+    del exp
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print("CUDA cleanup complete.")
+except Exception as _e:
+    print(f"Warning: CUDA cleanup failed: {_e}")
 # %%

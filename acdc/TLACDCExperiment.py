@@ -149,14 +149,25 @@ class TLACDCExperiment:
 
         # Parameter added for corrupted batch_size
         self.setup_corrupted_cache(corrupted_batch_size=corrupted_batch_size)
-        
+
         if self.corrupted_cache_cpu:
             self.global_cache.to("cpu", which_caches="corrupted")
+
+        # gc.collect() before empty_cache() ensures orphaned GPU tensors from the
+        # run_with_cache loop above are released by Python before CUDA frees them.
+        # Without this, fragmented allocator state can cause OOM on the next forward pass.
+        # This was identified as a contributing factor when diagnosing a CUDA OOM during
+        # the initial update_cur_metric call in __init__ on an RTX 3050 4GB.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self.setup_model_hooks(
             add_sender_hooks=add_sender_hooks,
             add_receiver_hooks=add_receiver_hooks,
         )
+        print("setup_model_hooks done")
+        gc.collect()
 
         self.using_wandb = using_wandb
         if using_wandb:
@@ -173,7 +184,15 @@ class TLACDCExperiment:
 
         self.metric = lambda x: metric(x).item()
         self.second_metric = second_metric
+        # Run on a single example first to avoid a Windows 0xC0000005 crash when
+        # running 50 examples with 1358 hooks active simultaneously on CPU.
+        # The initial metric just needs to be non-NaN; ACDC resets it per-step.
+        print("Running initial update_cur_metric (1 example)...")
+        _full_ds = self.ds
+        self.ds = _full_ds[:1]
         self.update_cur_metric(recalc_metric=True, recalc_edges=True)
+        self.ds = _full_ds
+        print("update_cur_metric done")
 
         self.threshold = threshold
         assert self.ref_ds is not None or self.zero_ablation, "If you're doing random ablation, you need a ref ds"
@@ -205,7 +224,8 @@ class TLACDCExperiment:
 
     def update_cur_metric(self, recalc_metric=True, recalc_edges=True, initial=False):
         if recalc_metric:
-            logits = self.model(self.ds)
+            with torch.no_grad():
+                logits = self.model(self.ds)
             self.cur_metric = self.metric(logits)
             if self.second_metric is not None:
                 self.cur_second_metric = self.second_metric(logits)
@@ -231,10 +251,12 @@ class TLACDCExperiment:
             assert len(hook.fwd_hooks) == 0, "Don't load the model with hooks *then* call this"
 
         new_graph = OrderedDict()
-        cache=OrderedDict()
-        self.model.cache_all(cache)
-        self.model(torch.arange(min(10, self.model.cfg.d_vocab)).unsqueeze(0)) # Some random forward pass so that we can see all the hook names
-        self.model.reset_hooks()
+        # Use run_with_cache instead of the deprecated cache_all to discover hook names.
+        with torch.no_grad():
+            _, _cache_obj = self.model.run_with_cache(
+                torch.arange(min(10, self.model.cfg.d_vocab)).unsqueeze(0)
+            )
+        cache = _cache_obj.cache_dict
 
         if self.verbose:
             print(self.corr.graph.keys())
@@ -425,39 +447,6 @@ class TLACDCExperiment:
 
         self.model.reset_hooks()
 
-        if self.zero_ablation:
-            # to calculate the inputs to each model component, 
-            # we need zero out all the outputs into the residual stream
-
-            # all hooknames that output into the residual stream
-            hook_name_substrings = ["hook_result", "mlp_out"]
-            if self.use_pos_embed:
-                hook_name_substrings.extend(["hook_pos_embed", "hook_embed"])
-            else:
-                hook_name_substrings.append("blocks.0.hook_resid_pre")
-
-            # add hooks to zero out all these hook points
-            hook_name_bool_function = lambda hook_name: any([hook_name_substring in hook_name for hook_name_substring in hook_name_substrings])
-            self.model.add_hook(
-                name = hook_name_bool_function,
-                hook = lambda z, hook: torch.zeros_like(z),
-            )
-            # we now add the saving hooks AFTER we've zeroed out activations
-
-        if self.use_pos_embed and not self.zero_ablation:    
-            def scramble_positions(z, hook):
-                z[:] = shuffle_tensor(z[0], seed=49)
-            self.model.add_hook(
-                "hook_pos_embed",
-                scramble_positions,
-            )
-            
-        self.model.cache_all(self.global_cache.corrupted_cache)
-        corrupt_stuff = self.model(self.ref_ds)
-        
-        # --- NEW: batched cache construction ---
-        # --- Circumvents the issue of corruption using a large chunk of memory at once, which may overload the memory of limited GPUs
-        # --- Sacrifice run-time for memory
         ref = self.ref_ds
         assert ref is not None, "ref_ds must be set for corrupted cache (unless zero_ablation fills it)."
         assert torch.is_tensor(ref), f"Expected ref_ds to be a torch.Tensor, got {type(ref)}"
@@ -466,40 +455,67 @@ class TLACDCExperiment:
         bs = int(corrupted_batch_size) if corrupted_batch_size else 0
 
         if bs <= 0:
-            # Old behaviour
+            # Old behaviour: pre-register hooks on the model then run a single forward pass.
+            if self.zero_ablation:
+                hook_name_substrings = ["hook_result", "mlp_out"]
+                if self.use_pos_embed:
+                    hook_name_substrings.extend(["hook_pos_embed", "hook_embed"])
+                else:
+                    hook_name_substrings.append("blocks.0.hook_resid_pre")
+                hook_name_bool_function = lambda hook_name: any([s in hook_name for s in hook_name_substrings])
+                self.model.add_hook(name=hook_name_bool_function, hook=lambda z, hook: torch.zeros_like(z))
+
+            if self.use_pos_embed and not self.zero_ablation:
+                def scramble_positions(z, hook):
+                    z[:] = shuffle_tensor(z[0], seed=49)
+                self.model.add_hook("hook_pos_embed", scramble_positions)
+
             self.model.cache_all(self.global_cache.corrupted_cache)
             corrupt_stuff = self.model(ref)
         else:
-            # Build the corrupted cache by running each batch and concatenating per hook.
-            # Creation of method assisted by Artificial Intelligence
-            
+            # Batched path: pass ablation and caching hooks explicitly to run_with_hooks so
+            # that no hooks are pre-registered on the model. Pre-registering hooks and then
+            # calling run_with_cache on top of them triggers a CUDA access violation
+            # (Windows 0xC0000005) in torch 2.5.1, crashing every run after the first.
             print("ref_ds shape:", tuple(self.ref_ds.shape), "corrupted_batch_size:", corrupted_batch_size)
             cache_lists = defaultdict(list)
 
-            # Do not build a computation graph for gradients, they are unnecessary at this stage
+            # Build ablation hooks (zeroing or position scrambling).
+            ablation_hooks = []
+            if self.zero_ablation:
+                hook_name_substrings = ["hook_result", "mlp_out"]
+                if self.use_pos_embed:
+                    hook_name_substrings.extend(["hook_pos_embed", "hook_embed"])
+                else:
+                    hook_name_substrings.append("blocks.0.hook_resid_pre")
+                _zero_filter = lambda hook_name: any([s in hook_name for s in hook_name_substrings])
+                ablation_hooks.append((_zero_filter, lambda z, hook: torch.zeros_like(z)))
+            elif self.use_pos_embed:
+                def _scramble(z, hook):
+                    z[:] = shuffle_tensor(z[0], seed=49)
+                ablation_hooks.append(("hook_pos_embed", _scramble))
+
+            # Build per-hook-point caching closures. Hooks fire after ablation hooks,
+            # so they capture the already-zeroed/scrambled activation values.
+            def _make_cache_fn(name):
+                def _cache(z, hook):
+                    cache_lists[name].append(z.detach().to("cpu"))
+                return _cache
+            cache_hooks = [(name, _make_cache_fn(name)) for name in self.model.hook_dict.keys()]
+
+            fwd_hooks = ablation_hooks + cache_hooks
+
             with torch.no_grad():
-                
-                # Iterate over the corruption/reference inputs, doing a set amount at a time (chosen by user, default is all of them)
                 for i in range(0, ref.shape[0], bs):
                     batch = ref[i : i + bs]
+                    self.model.run_with_hooks(batch, fwd_hooks=fwd_hooks)
 
-                    # Forward pass, return cached activations
-                    # run_with_cache returns (output, cache)
-                    out, cache = self.model.run_with_cache(batch)
-
-                    # Iterate over cached activations
-                    # name = hook name string
-                    # act = tensor stored for that hook point (in this batch)
-                    for name, act in cache.cache_dict.items():
-                        # remove gradient tracking [.detach()] and then move the tensor to CPU RAM
-                        # Then add the output to the list of cached activations, which is concattenated later for the final output
-                        cache_lists[name].append(act.detach().to("cpu"))
-
-            # Concatenate along the batch dimension and write into global_cache
-            # FIrst make sure the corrupted cache is clear, then write into it with the full cache
+            # Concatenate along the batch dimension and write into global_cache.
             self.global_cache.corrupted_cache.clear()
-            for name, chunks in cache_lists.items():
+            for name in list(cache_lists.keys()):
+                chunks = cache_lists.pop(name)
                 self.global_cache.corrupted_cache[name] = torch.cat(chunks, dim=0)
+                del chunks
 
         # --- END NEW ---
         
