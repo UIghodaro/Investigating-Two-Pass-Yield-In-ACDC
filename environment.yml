@@ -1,7 +1,6 @@
 name: acdc_NEW
 channels:
   - conda-forge
-  - defaults
 dependencies:
   - _openmp_mutex=4.5
   - bzip2=1.0.8
