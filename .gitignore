@@ -71,10 +71,12 @@ ims/
 mode_b_stats.json
 
 # Personal files that were used for notes/reference on on experiment design, planning and execution/analysis
+CLAUDE.md
 MyModifications.txt
 designPlan.txt
 CS344__January_Progress_Report (1).pdf
 marginal_gain_explainer.md
 cross_example_swap_explainer.md
 Findings_Insights.txt
+.claude
 report
