@@ -26,35 +26,14 @@ This project systematically benchmarks nine corruption strategies applied to Aut
 
 ## Environment Setup
 
-**Requirements:** Windows 10/11, Miniconda, Graphviz
+**Requirements:** Windows 10/11, Miniconda virtual environment (downloadable from the anaconda website),  ~8GB disk space (~6GB is used for env downloads)
 
-### 1. Create the conda environment
 
 ```bash
-conda create -n acdc python=3.10
+# environment.yml contains the necessary dependencies and pip components for running the suite
+conda env create -f environment.yml -n acdc
 conda activate acdc
-pip install -r requirements_lock.txt
 ```
-
-You may also use a venv on Linux or macOS, then install requirements via:
-
-```bash
-poetry install
-```
-
-### 2. Install Graphviz
-
-Download and install from https://graphviz.org/download/ (Windows installer).  
-Default install path: `C:/Program Files/Graphviz/bin/`  
-Open a **fresh command prompt terminal** after installation so the PATH is active.
-
-### 3. Verify setup
-
-```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" -c "import acdc; print('OK')"
-```
-
-> **Important:** Always invoke via the full conda env path or `conda activate acdc` first. System Python will most likely be on a newer version, causing it to crash.
 
 > **Model download:** The first ACDC run downloads the `attn-only-4l` model weights (~50 MB) from HuggingFace automatically via TransformerLens. An internet connection is required for this step; subsequent runs use the cached copy.
 
@@ -62,34 +41,28 @@ Open a **fresh command prompt terminal** after installation so the PATH is activ
 
 ## Reproducing Results
 
-All authoritative results use suite **`SUITE_20260324_041413`** (τ = 0.10), included in `runs/`.  
-Pre-computed results are in `runs/` and `analysis/` — re-running is only necessary to verify from scratch.
-
+All authoritative results used were ran on a suite using threshold τ = 0.10 with cpu as the device
 ### Stage 0 — Run the corruption suite
 
 Runs all 9 conditions (8 corruptions + zero ablation) over ACDC in one go and retrieves circuits. Saves results to `runs/`:
 
 ```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" run_suite.py \
-    --task docstring \
-    --device cpu \
-    --threshold 0.10 \
-    --seeds 0
+# Run the following in terminal - if there are errors then please check that the env has been correctly set up
+python run_suite.py --task docstring --device cpu --threshold 0.10 --seeds 0
 ```
 
 Output: `runs/SUITE_<timestamp>_docstring.json` plus per-run subdirectories with edge pkl files, stdout logs, and Mode B stats.
 
-> **Runtime:** Each of the 9 ACDC conditions takes approximately 20–40 minutes on CPU. Allow **4–6 hours** for the full suite to complete. The suite runs sequentially with a 30-second pause between conditions to release OS resources.
+> **Runtime:** Each of the 9 ACDC conditions takes approximately 20–40 minutes on CPU. 4–6 hours were used for the full suite to complete. The suite runs sequentially with a 30-second pause between conditions to release OS resources.
 
-> Multiple seeds produce identical results — the Docstring dataset generator uses a fixed internal seed independent of `--seed`.
+> Multiple seeds produce identical results — the Docstring dataset generator uses a fixed internal seed independent of `--seed`... so no use fiddling with it
 
 ### Stage 1 — Yield table + Jaccard / complementarity analysis
 
 Computes Mode B stats (precision, recall, F1 vs ground truth) for all recovered circuits, alongside pairwise Jaccard similarity:
 
 ```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" analyse_suite.py \
-    --suite-json runs/SUITE_<timestamp>_docstring.json
+python analyse_suite.py --suite-json runs/SUITE_<timestamp>_docstring.json
 ```
 
 Output: Mode B yield table — saved to `analysis/stage1_yield/`; N×N Jaccard matrix JSON and heatmap PNG — saved to `analysis/stage2_jaccard/`.
@@ -99,8 +72,7 @@ Output: Mode B yield table — saved to `analysis/stage1_yield/`; N×N Jaccard m
 Tests all pairwise naive unions of circuits from the suite under Mode B (F1 vs ground truth):
 
 ```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" two_pass.py \
-    --suite-json runs/SUITE_<timestamp>_docstring.json
+python two_pass.py --suite-json runs/SUITE_<timestamp>_docstring.json
 ```
 
 Output: pairwise union stats and ΔRecall matrix — saved to `analysis/stage3a_naive_union/`.
@@ -110,7 +82,7 @@ Output: pairwise union stats and ΔRecall matrix — saved to `analysis/stage3a_
 Runs the MBG filtered two-pass procedure using two specified conditions from the suite:
 
 ```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" marginal_bundle_gain.py \
+python marginal_bundle_gain.py \
     --suite-json runs/SUITE_<timestamp>_docstring.json \
     --condition-a random_random \
     --condition-b zero_ablation \
@@ -128,7 +100,7 @@ Pre-computed results are in `analysis/` — re-running is only necessary to veri
 
 ```bash
 # Resample ablation (primary, Conmy-comparable)
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" eval_circuit_efficiency.py \
+python eval_circuit_efficiency.py \
     --task docstring --device cpu --corruption random_random \
     --pkl random_random runs/SUITE_<timestamp>_docstring/<run_dir>/another_final_edges.pkl \
     --pkl zero_ablation runs/SUITE_<timestamp>_docstring/<run_dir>/another_final_edges.pkl \
@@ -137,7 +109,7 @@ Pre-computed results are in `analysis/` — re-running is only necessary to veri
     --out analysis/mode_a_resample.json
 
 # Zero ablation (secondary)
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" eval_circuit_efficiency.py \
+python eval_circuit_efficiency.py \
     --task docstring --device cpu --corruption zero \
     --pkl random_random runs/SUITE_<timestamp>_docstring/<run_dir>/another_final_edges.pkl \
     --out analysis/mode_a_zero.json
@@ -148,7 +120,7 @@ Pre-computed results are in `analysis/` — re-running is only necessary to veri
 Runs pygraphviz to generate circuit diagrams:
 
 ```bash
-"C:/Users/<you>/miniconda3/envs/acdc/python.exe" visualise_circuits.py \
+python visualise_circuits.py \
     --suite-json runs/SUITE_<timestamp>_docstring.json \
     --conditions random_random random_doc random_def random_answer \
                  random_def_doc random_answer_doc \
@@ -177,20 +149,11 @@ Output: PNG/SVG circuit diagrams — saved to `images/circuits/`.
 
 ---
 
-## Threshold Variants
-
-Results at additional thresholds are available in:
-- `runs/SUITE_20260317_043132` — τ = 0.067
-- `runs/SUITE_20260323_183200` — τ = 0.085
-- `runs/SUITE_20260326_035915` — τ = 0.095
-- `runs/SUITE_20260324_041413` — τ = 0.10 **(primary)**
-
----
-
 ## Modifications to Upstream Codebase
 
-The following changes were made to the original Conmy (2023) ACDC repo:
+The following changes were made to the original Conmy (2023) ACDC rep alongside the additional python files:
 
+- As of the most recent commit, all google colab integration has been removed (including use of plotly, colab, etc... this may be re-implemented soon, though my additions do not at all interact with google colab)
 - `--dataset-version` flag in `acdc/main.py` to expose the full corruption family
 - `--corrupted-batch-size` batching in `TLACDCExperiment.py` for memory efficiency
 - Mode B ground truth evaluation (recall bug fix) at end of `acdc/main.py`

@@ -9,6 +9,7 @@
 # <p>Janky code to do different setup when run in a Colab notebook vs VSCode (adapted from e.g <a href="https://github.com/neelnanda-io/TransformerLens/blob/5c89b7583e73ce96db5e46ef86a14b15f303dde6/demos/Activation_Patching_in_TL_Demo.ipynb">this notebook</a>)</p>
 
 #%%
+"""
 try:
     import google.colab
 
@@ -31,29 +32,30 @@ try:
     )
 
 except Exception as e:
-    IN_COLAB = False
-    print("Running outside of colab")
+"""
+IN_COLAB = False
+print("Running outside of colab")
 
-    import numpy # crucial to not get cursed error
-    import plotly
+import numpy # crucial to not get cursed error
+#import plotly
 
-    plotly.io.renderers.default = "colab"  # added by Arthur so running as a .py notebook with #%% generates .ipynb notebooks that display in colab
-    # disable this option when developing rather than generating notebook outputs
+#plotly.io.renderers.default = "colab"  # added by Arthur so running as a .py notebook with #%% generates .ipynb notebooks that display in colab
+# disable this option when developing rather than generating notebook outputs
 
-    import os # make images folder
-    if not os.path.exists("ims/"):
-        os.mkdir("ims/")
+import os # make images folder
+if not os.path.exists("ims/"):
+    os.mkdir("ims/")
+"""
+from IPython import get_ipython
 
-    from IPython import get_ipython
-
-    ipython = get_ipython()
-    if ipython is not None:
-        print("Running as a notebook")
-        ipython.run_line_magic("load_ext", "autoreload")  # type: ignore
-        ipython.run_line_magic("autoreload", "2")  # type: ignore
-    else:
-        print("Running as a script")
-
+ipython = get_ipython()
+if ipython is not None:
+    print("Running as a notebook")
+    ipython.run_line_magic("load_ext", "autoreload")  # type: ignore
+    ipython.run_line_magic("autoreload", "2")  # type: ignore
+else:
+"""
+print("Running as a script")
 # %% [markdown]
 # <h2>Imports etc</h2>
 
@@ -66,8 +68,8 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*_register_p
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
 
 import wandb
-import IPython
-from IPython.display import Image, display
+#import IPython
+#from IPython.display import Image, display
 import torch
 import gc
 from tqdm import tqdm
@@ -85,11 +87,11 @@ import yaml
 import pandas
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.io as pio
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
+#import matplotlib.pyplot as plt
+#import plotly.express as px
+#import plotly.io as pio
+#from plotly.subplots import make_subplots
+#import plotly.graph_objects as go
 
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 from transformer_lens.HookedTransformer import (
@@ -184,21 +186,23 @@ parser.add_argument("--dataset-version", type=str, default="random_random",
          "random_answer_doc, random_random, vary_length_doc_desc, "
          "vary_length_doc_desc_random_doc. Only used when --task=docstring.")
 
+"""
 if ipython is not None:
     # We are in a notebook
-    # you can put the command you would like to run as the ... in r"""..."""
+    # you can put the command you would like to run as the ... in r
     args = parser.parse_args(
-        [line.strip() for line in r"""--task=induction\
+        [line.strip() for line in r--task=induction\
 --zero-ablation\
 --threshold=0.71\
 --indices-mode=reverse\
 --first-cache-cpu=False\
 --second-cache-cpu=False\
---max-num-epochs=100000""".split("\\\n")]
+--max-num-epochs=100000.split("\\\n")]
     )
 else:
-    # read from command line
-    args = parser.parse_args()
+"""
+# read from command line
+args = parser.parse_args()
 
 # Process args
 
@@ -337,7 +341,7 @@ gc.collect()
 torch.cuda.empty_cache()
 
 # Setup wandb if needed
-if WANDB_RUN_NAME is None or IPython.get_ipython() is not None:
+if WANDB_RUN_NAME is None: #or IPython.get_ipython() is not None:
     WANDB_RUN_NAME = f"{ct()}{'_randomindices' if INDICES_MODE=='random' else ''}_{THRESHOLD}{'_zero' if ZERO_ABLATION else ''}"
 else:
     assert WANDB_RUN_NAME is not None, "I want named runs, always"
@@ -397,7 +401,7 @@ exp_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 for i in range(args.max_num_epochs):
     print('>>> Iteration',i)
     exp.step(testing=False)
-
+    """
     # If running in google COLAB or ipython, a graphviz image is generated and shown every time an edge is pruned. 
     # Condition this functionality so that main can run with less overhead - especially since the pictures aren't shown in terminal
     if IN_COLAB or ipython is not None:
@@ -410,6 +414,7 @@ for i in range(args.max_num_epochs):
     if IN_COLAB or ipython is not None:
         # so long as we're not running this as a script, show the image!
         display(Image(f"ims/img_new_{i+1}.png"))
+    """
 
     print(i, "-" * 50)
     print(exp.count_no_edges())

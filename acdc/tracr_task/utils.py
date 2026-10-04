@@ -1,8 +1,8 @@
-import IPython
+#import IPython
 from acdc.docstring.utils import AllDataThings
-if IPython.get_ipython() is not None:
-    IPython.get_ipython().magic('load_ext autoreload')
-    IPython.get_ipython().magic('autoreload 2')
+#if IPython.get_ipython() is not None:
+#    IPython.get_ipython().magic('load_ext autoreload')
+#    IPython.get_ipython().magic('autoreload 2')
         
 from typing import Literal, List, Tuple, Dict, Any, Optional, Union, Callable, TypeVar, Iterable, Set
 from transformer_lens import HookedTransformer, HookedTransformerConfig
@@ -13,8 +13,8 @@ import torch
 import numpy as np
 from functools import partial
 from acdc.acdc_utils import kl_divergence
-from tracr.rasp import rasp
-from tracr.compiler import compiling
+#from tracr.rasp import rasp
+#from tracr.compiler import compiling
 import torch.nn.functional as F
 
 bos = "BOS"
@@ -220,7 +220,7 @@ def get_tracr_model_input_and_tl_model(task: Literal["reverse", "proportion"], d
     # 
     # (The logits are the first 3 dimensions of the residual stream, and we can see that they're flipped!)
 
-    import plotly.express as px
+    #import plotly.express as px
     im = cache["resid_post", -1].detach().cpu().numpy()[0]
     # px.imshow(im, color_continuous_scale="Blues", labels={"x":"Residual Stream", "y":"Position"}, y=[str(i) for i in input]).show()
 
